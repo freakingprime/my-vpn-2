@@ -210,76 +210,40 @@ var dockerHTTPClient = &http.Client{
 	Timeout: 30 * time.Second,
 }
 
-func inspectGluetunDetail() (running bool, paused bool, healthStatus string, ipAddr string, startedAt time.Time) {
+func inspectGluetunHealth() (running bool, healthStatus string) {
 	req, _ := http.NewRequest("GET", fmt.Sprintf("http://localhost/containers/%s/json", gluetunContainer), nil)
 	resp, err := dockerHTTPClient.Do(req)
 	if err != nil {
-		return false, false, "error", "", time.Time{}
+		return false, "error"
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return false, false, "not-found", "", time.Time{}
+		return false, "not-found"
 	}
 	var data struct {
 		State struct {
-			Running   bool   `json:"Running"`
-			Paused    bool   `json:"Paused"`
-			StartedAt string `json:"StartedAt"`
-			Health    *struct {
+			Running bool `json:"Running"`
+			Health  *struct {
 				Status string `json:"Status"`
 			} `json:"Health"`
 		} `json:"State"`
-		NetworkSettings struct {
-			IPAddress string `json:"IPAddress"`
-			Networks  map[string]struct {
-				IPAddress string `json:"IPAddress"`
-			} `json:"Networks"`
-		} `json:"NetworkSettings"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return false, false, "decode-error", "", time.Time{}
-	}
-	if t, err := time.Parse(time.RFC3339Nano, data.State.StartedAt); err == nil {
-		startedAt = t
-	}
-	ip := data.NetworkSettings.IPAddress
-	if ip == "" {
-		for _, netCfg := range data.NetworkSettings.Networks {
-			if netCfg.IPAddress != "" {
-				ip = netCfg.IPAddress
-				break
-			}
-		}
+		return false, "decode-error"
 	}
 	if !data.State.Running {
-		return false, false, "stopped", ip, startedAt
-	}
-	if data.State.Paused {
-		return true, true, "paused", ip, startedAt
+		return false, "stopped"
 	}
 	if data.State.Health == nil {
-		return true, false, "no-healthcheck", ip, startedAt
+		return true, "no-healthcheck"
 	}
-	return true, false, data.State.Health.Status, ip, startedAt
+	return true, data.State.Health.Status
 }
 
-func inspectGluetunState() (running bool, paused bool, healthStatus string) {
-	r, p, h, _, _ := inspectGluetunDetail()
-	return r, p, h
-}
-
-func inspectGluetunHealth() (running bool, healthStatus string) {
-	r, p, h, _, _ := inspectGluetunDetail()
-	if !r || p {
-		return false, h
-	}
-	return true, h
-}
-
-func pauseGluetunContainer() {
-	running, paused, _, _, _ := inspectGluetunDetail()
-	if running && !paused {
-		req, _ := http.NewRequest("POST", fmt.Sprintf("http://localhost/containers/%s/pause", gluetunContainer), nil)
+func stopGluetunContainer() {
+	running, _ := inspectGluetunHealth()
+	if running {
+		req, _ := http.NewRequest("POST", fmt.Sprintf("http://localhost/containers/%s/stop?t=5", gluetunContainer), nil)
 		resp, err := dockerHTTPClient.Do(req)
 		if err == nil && resp != nil {
 			resp.Body.Close()
@@ -287,106 +251,21 @@ func pauseGluetunContainer() {
 	}
 }
 
-func unpauseGluetunContainer() {
-	running, paused, _, _, _ := inspectGluetunDetail()
-	if running && paused {
-		req, _ := http.NewRequest("POST", fmt.Sprintf("http://localhost/containers/%s/unpause", gluetunContainer), nil)
-		resp, err := dockerHTTPClient.Do(req)
-		if err == nil && resp != nil {
-			resp.Body.Close()
-		}
+func startOrRestartGluetun() error {
+	running, _ := inspectGluetunHealth()
+	action := "start"
+	if running {
+		action = "restart?t=5"
 	}
-}
-
-func setGluetunVPNStatus(status string) error {
-	_, _, _, ip, _ := inspectGluetunDetail()
-	if ip == "" {
-		return fmt.Errorf("gluetun container IP not found")
-	}
-	body := strings.NewReader(fmt.Sprintf(`{"status":%q}`, status))
-	req, err := http.NewRequest("PUT", fmt.Sprintf("http://%s:8000/v1/vpn/status", ip), body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("control server HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	return nil
-}
-
-func standbyGluetunContainer() {
-	running, paused, _, _, startedAt := inspectGluetunDetail()
-	if !running || paused {
-		return
-	}
-	// Never freeze Gluetun mid-boot while it is initializing routing/iptables
-	if !startedAt.IsZero() && time.Since(startedAt) < 6*time.Second {
-		time.Sleep(6*time.Second - time.Since(startedAt))
-	}
-	// Wait briefly until Gluetun's control server on :8000 stops the OpenVPN subprocess cleanly
-	for i := 0; i < 8; i++ {
-		if err := setGluetunVPNStatus("stopped"); err == nil {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	pauseGluetunContainer()
-}
-
-func reloadGluetunTunnel() error {
-	running, paused, _, _, startedAt := inspectGluetunDetail()
-	if !running {
-		req, _ := http.NewRequest("POST", fmt.Sprintf("http://localhost/containers/%s/start", gluetunContainer), nil)
-		resp, err := dockerHTTPClient.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 400 && resp.StatusCode != 304 {
-			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("docker start HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-		}
-		return nil
-	}
-
-	if paused {
-		unpauseGluetunContainer()
-		time.Sleep(300 * time.Millisecond)
-	}
-
-	// Ensure Gluetun has finished initial boot if it was just started or unpaused from boot
-	if !startedAt.IsZero() && time.Since(startedAt) < 5*time.Second {
-		time.Sleep(5*time.Second - time.Since(startedAt))
-	}
-
-	// Reload OpenVPN tunnel in-place via Gluetun Control Server (:8000) without stopping/restarting the container
-	_ = setGluetunVPNStatus("stopped")
-	time.Sleep(400 * time.Millisecond)
-	if err := setGluetunVPNStatus("running"); err == nil {
-		log.Println("[GLUETUN] Reloaded OpenVPN tunnel in-place via Control Server API (:8000).")
-		return nil
-	} else {
-		log.Printf("[GLUETUN] Control Server reload fallback (%v); performing clean unpaused restart...", err)
-	}
-
-	// Fallback only if container was created prior to /gluetun/auth/config.toml
-	req, _ := http.NewRequest("POST", fmt.Sprintf("http://localhost/containers/%s/restart?t=10", gluetunContainer), nil)
+	req, _ := http.NewRequest("POST", fmt.Sprintf("http://localhost/containers/%s/%s", gluetunContainer, action), nil)
 	resp, err := dockerHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= 400 && resp.StatusCode != 304 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("docker restart HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("docker %s HTTP %d: %s", action, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
 }
@@ -519,7 +398,7 @@ func (c *Controller) SwitchToNUC() error {
 	c.mu.Unlock()
 
 	c.closeSSH()
-	standbyGluetunContainer()
+	stopGluetunContainer()
 
 	c.mu.Lock()
 	c.activeMode = ModeNUC
@@ -541,7 +420,7 @@ func (c *Controller) SwitchToGCE() error {
 	c.transitionStatus = fmt.Sprintf("Connecting on-demand SSH tunnel to Google Cloud VM (%s)...", gceHost)
 	c.mu.Unlock()
 
-	standbyGluetunContainer()
+	stopGluetunContainer()
 
 	_, err := c.ensureSSHConnected()
 	if err != nil {
@@ -632,14 +511,14 @@ func (c *Controller) SwitchToVPNGate(ip, country, b64Config string) error {
 		homeInfo = c.fetchIPWithDialer(d.DialContext)
 	}
 
-	// Start/Reload Gluetun tunnel without stopping the container
-	if err := reloadGluetunTunnel(); err != nil {
+	// Start/Restart Gluetun container
+	if err := startOrRestartGluetun(); err != nil {
 		c.mu.Lock()
 		c.activeMode = ModeNUC
 		c.isTransitioning = false
 		c.transitionStatus = ""
 		c.mu.Unlock()
-		return fmt.Errorf("failed reloading Gluetun tunnel: %w", err)
+		return fmt.Errorf("failed starting Gluetun container: %w", err)
 	}
 
 	// Poll healthcheck & tunnel exit verification up to HealthTimeout
@@ -668,7 +547,7 @@ func (c *Controller) SwitchToVPNGate(ip, country, b64Config string) error {
 	}
 
 	if finalStatus != "healthy" && finalStatus != "no-healthcheck" {
-		standbyGluetunContainer()
+		stopGluetunContainer()
 		c.mu.Lock()
 		c.activeMode = ModeNUC
 		c.vpngateServerIP = ""
@@ -1443,7 +1322,7 @@ const htmlTemplate = `<!DOCTYPE html>
                 <div class="target-header">
                     <span class="target-title">3. VPNGate Volunteer Server</span>
                     <span class="badge {{ if eq .ActiveMode "vpngate" }}badge-active{{ else }}badge-standby{{ end }}" id="badge-vpngate">
-                        {{ if eq .ActiveMode "vpngate" }}ACTIVE{{ else if .GluetunPaused }}STANDBY (0% CPU){{ else }}ON-DEMAND{{ end }}
+                        {{ if eq .ActiveMode "vpngate" }}ACTIVE{{ else }}ON-DEMAND{{ end }}
                     </span>
                 </div>
                 <div class="target-desc">
@@ -1830,15 +1709,12 @@ func startWebServer(c *Controller) {
 			hostIP = h
 		}
 
-		_, gluetunPaused, _ := inspectGluetunState()
-
 		data := map[string]interface{}{
 			"HostIP":         hostIP,
 			"WebPort":        webPort,
 			"ProxyPort":      proxyPort,
 			"GCEHost":        gceHost,
 			"ActiveMode":     activeMode,
-			"GluetunPaused":  gluetunPaused,
 			"VPNGateIP":      vpngateIP,
 			"VPNGateCountry": vpngateCountry,
 			"ExitInfo":       exitInfo,
@@ -1888,12 +1764,10 @@ func startWebServer(c *Controller) {
 		c.mu.RUnlock()
 
 		exitInfo, homeInfo, _ := c.refreshIPStatus(false)
-		_, gluetunPaused, _ := inspectGluetunState()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"ok":              true,
 			"activeMode":      mode,
-			"gluetunPaused":   gluetunPaused,
 			"isTransitioning": transitioning,
 			"vpngateIP":       vpngateIP,
 			"vpngateCountry":  vpngateCountry,
@@ -2128,32 +2002,14 @@ func ensureStandbyCustomConf() {
 	}
 }
 
-func ensureGluetunAuthConfig() {
-	authDir := filepath.Join(dataDir, "auth")
-	_ = os.MkdirAll(authDir, 0755)
-	confPath := filepath.Join(authDir, "config.toml")
-	tomlContent := `[[roles]]
-name = "my-vpn-2-controller"
-routes = [
-  "GET /v1/vpn/status",
-  "PUT /v1/vpn/status",
-  "GET /v1/publicip/ip"
-]
-auth = "none"
-`
-	if err := os.WriteFile(confPath, []byte(tomlContent), 0644); err == nil {
-		log.Println("[CONFIG] Initialized Gluetun Control Server auth/config.toml.")
-	}
-}
-
 func main() {
 	_ = os.MkdirAll(dataDir, 0755)
+	_ = os.RemoveAll(filepath.Join(dataDir, "auth"))
 	ensureStandbyCustomConf()
-	ensureGluetunAuthConfig()
 	ctrl := NewController()
 
-	// Ensure default startup state: Direct (Local ISP) (cleanly stop internal VPN and pause Gluetun after boot completes)
-	go standbyGluetunContainer()
+	// Ensure default startup state: Direct (Local ISP) (stop Gluetun if running)
+	stopGluetunContainer()
 	ctrl.startInactivityWatchdog()
 
 	// Pre-warm IP check & server list in background

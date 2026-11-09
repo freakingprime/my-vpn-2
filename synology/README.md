@@ -15,8 +15,6 @@ In Synology **File Station**, create `/volume1/docker/my-vpn-2`:
     ├── .env                     <-- Environment configuration (ports & SSH target)
     ├── id_rsa                   <-- SSH private key (OpenSSH PEM format, chmod 600)
     ├── custom.conf              <-- Auto-managed standby config for Gluetun
-    ├── auth/
-    │   └── config.toml          <-- Auto-managed Gluetun control API config
     └── exit_history.json        <-- Auto-managed state file
 ```
 

@@ -4,7 +4,7 @@ An ultra-lightweight Go HTTP/HTTPS Proxy Gateway and Web Controller that lets yo
 
 1. **Direct (Local ISP)**: Routes directly out through your local internet connection. Both GCE SSH and Gluetun sleep (`0` background load).
 2. **Google Cloud / VPS VM (SSH Tunnel)**: Connects an on-demand encrypted SSH tunnel via `golang.org/x/crypto/ssh` to your configured remote server (`GCE_HOST`).
-3. **VPNGate Public VPN (`vpngate.net`)**: Dynamically reloads `qmcgaw/gluetun` (`my-vpn-2_vpn`) on-demand with your selected volunteer OpenVPN server.
+3. **VPNGate Public VPN (`vpngate.net`)**: Starts `qmcgaw/gluetun` (`my-vpn-2_vpn`) on-demand with your selected volunteer OpenVPN server.
 
 ## Endpoints
 
@@ -16,7 +16,7 @@ An ultra-lightweight Go HTTP/HTTPS Proxy Gateway and Web Controller that lets yo
 
 - **Battle-Tested Go Stack**: Built with [`elazarl/goproxy`](https://github.com/elazarl/goproxy) and [`golang.org/x/crypto/ssh`](https://pkg.go.dev/golang.org/x/crypto/ssh) in a single ~12 MB static binary.
 - **Pre-Built Public Container Image**: Automatically built via GitHub Actions and published to `ghcr.io/freakingprime/my-vpn-2:latest` (`linux/amd64`).
-- **4-Hour Inactivity Auto-Shutoff**: Automatically switches back to **Direct (Local ISP)** and pauses Gluetun / closes SSH after 4 hours of proxy inactivity.
+- **4-Hour Inactivity Auto-Shutoff**: Automatically switches back to **Direct (Local ISP)** and stops Gluetun / closes SSH after 4 hours of proxy inactivity.
 - **Fail-Closed Switching**: Blocks proxy requests while a target tunnel is starting/handshaking so your home IP never leaks during transitions.
 - **On-Demand Ping & Country Grouping**: Probes both TCP and UDP OpenVPN servers and sorts reachable servers by score and latency.
 

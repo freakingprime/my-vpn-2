@@ -188,6 +188,10 @@ try {
     Write-Host "Portainer raw response: $deployRespRaw" -ForegroundColor Yellow
 }
 
+# Ensure my-vpn-2_vpn (gluetun) is stopped initially since default mode is Direct (Local ISP)
+Start-Sleep -Seconds 3
+& curl.exe -k -s -X POST -H "X-API-Key: $apiKey" "$portainerUrl/api/endpoints/$endpointId/docker/containers/my-vpn-2_vpn/stop?t=5" | Out-Null
+
 # Verify Web UI & Proxy Health
 Write-Host "`nVerifying my-vpn-2 Web UI ($webUrl) and Proxy ($proxyUrl)..." -ForegroundColor Cyan
 for ($i = 1; $i -le 15; $i++) {
