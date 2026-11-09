@@ -1,0 +1,22 @@
+# Ignore private SSH keys and local secrets
+*.key
+*.pem
+*.ppk
+*_id_rsa
+id_rsa
+credentials/
+.env
+synology/.env
+
+# Ignore local private documentation
+README.local.md
+*.local.md
+
+# Ignore image archives and runtime state files
+*.tar
+*.tar.gz
+exit_history.json
+synology/auth/
+auth/
+data/
+first.txt

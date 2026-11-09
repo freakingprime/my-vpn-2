@@ -1,0 +1,39 @@
+services:
+  controller:
+    build: .
+    image: ghcr.io/freakingprime/my-vpn-2:latest
+    container_name: my-vpn-2_controller
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+      - DATA_DIR=/data
+      - GLUETUN_CONTAINER=my-vpn-2_vpn
+      - GLUETUN_PROXY_ADDR=127.0.0.1:18888
+
+  vpn:
+    image: qmcgaw/gluetun:latest
+    container_name: my-vpn-2_vpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "127.0.0.1:18888:8888/tcp"
+    environment:
+      - VPN_SERVICE_PROVIDER=custom
+      - VPN_TYPE=openvpn
+      - OPENVPN_USER=vpn
+      - OPENVPN_PASSWORD=vpn
+      - OPENVPN_CUSTOM_CONFIG=/gluetun/custom.conf
+      - HTTPPROXY=on
+      - HTTPPROXY_LISTENING_ADDRESS=:8888
+      - FIREWALL=off
+    volumes:
+      - ./data:/gluetun
+    restart: "no"
