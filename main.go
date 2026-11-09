@@ -52,7 +52,7 @@ var (
 	gceHost          = getEnv("GCE_HOST", "203.0.113.10:22")
 	gceUser          = getEnv("GCE_USER", "cloud-user")
 	gceKeyPath       = getEnv("GCE_KEY_PATH", "/data/id_rsa")
-	gluetunContainer = getEnv("GLUETUN_CONTAINER", "my-vpn-2_vpn")
+	gluetunContainer = getEnv("GLUETUN_CONTAINER", "my-vpn-2-vpn")
 	gluetunProxyAddr = getEnv("GLUETUN_PROXY_ADDR", "127.0.0.1:18888")
 	dockerSockPath   = getEnv("DOCKER_SOCK", "/var/run/docker.sock")
 

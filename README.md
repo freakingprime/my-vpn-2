@@ -4,7 +4,7 @@ An ultra-lightweight Go HTTP/HTTPS Proxy Gateway and Web Controller that lets yo
 
 1. **Direct (Local ISP)**: Routes directly out through your local internet connection. Both GCE SSH and Gluetun sleep (`0` background load).
 2. **Google Cloud / VPS VM (SSH Tunnel)**: Connects an on-demand encrypted SSH tunnel via `golang.org/x/crypto/ssh` to your configured remote server (`GCE_HOST`).
-3. **VPNGate Public VPN (`vpngate.net`)**: Starts `qmcgaw/gluetun` (`my-vpn-2_vpn`) on-demand with your selected volunteer OpenVPN server.
+3. **VPNGate Public VPN (`vpngate.net`)**: Starts `qmcgaw/gluetun` (`my-vpn-2-vpn`) on-demand with your selected volunteer OpenVPN server.
 
 ## Endpoints
 

@@ -76,7 +76,7 @@ $containersRaw = & curl.exe -k -s -H "X-API-Key: $apiKey" "$portainerUrl/api/end
 $containers = $containersRaw | ConvertFrom-Json
 foreach ($c in $containers) {
     foreach ($n in $c.Names) {
-        if ($n -in @("/vpn_manager", "/vpngate_client", "/socks5_proxy", "/vpngate2_controller", "/vpngate2_vpn")) {
+        if ($n -in @("/vpn_manager", "/vpngate_client", "/socks5_proxy", "/vpngate2_controller", "/vpngate2_vpn", "/my-vpn-2_controller", "/my-vpn-2_vpn", "/my-vpn-2-controller", "/my-vpn-2-vpn")) {
             Write-Host ">> Removing legacy container $n..." -ForegroundColor Cyan
             & curl.exe -k -s -X DELETE -H "X-API-Key: $apiKey" "$portainerUrl/api/endpoints/$endpointId/docker/containers/$($c.Id)?v=1&force=1" | Out-Null
         }
@@ -106,7 +106,7 @@ $prepObj = @{
 }
 $tmpPrep = [System.IO.Path]::GetTempFileName()
 [System.IO.File]::WriteAllText($tmpPrep, ($prepObj | ConvertTo-Json -Depth 5 -Compress), [System.Text.Encoding]::ASCII)
-$prepResp = & curl.exe -k -s -X POST -H "X-API-Key: $apiKey" -H "Content-Type: application/json" -d "@$tmpPrep" "$portainerUrl/api/endpoints/$endpointId/docker/containers/create?name=my-vpn-2_prep_tmp" | ConvertFrom-Json
+$prepResp = & curl.exe -k -s -X POST -H "X-API-Key: $apiKey" -H "Content-Type: application/json" -d "@$tmpPrep" "$portainerUrl/api/endpoints/$endpointId/docker/containers/create?name=my-vpn-2-prep-tmp" | ConvertFrom-Json
 Remove-Item $tmpPrep -Force -ErrorAction SilentlyContinue
 if ($prepResp.Id) {
     & curl.exe -k -s -X POST -H "X-API-Key: $apiKey" "$portainerUrl/api/endpoints/$endpointId/docker/containers/$($prepResp.Id)/start" | Out-Null
@@ -117,7 +117,7 @@ if ($prepResp.Id) {
 
 # 3. Build Docker image directly on host via Docker Build API
 Write-Host "`n[3/5] Building Go Docker image '$imageTag' on $nucHost..." -ForegroundColor Yellow
-$tarPath = Join-Path ([System.IO.Path]::GetTempPath()) "my-vpn-2_build_ctx.tar.gz"
+$tarPath = Join-Path ([System.IO.Path]::GetTempPath()) "my-vpn-2-build-ctx.tar.gz"
 if (Test-Path $tarPath) { Remove-Item $tarPath -Force }
 & tar.exe -czf $tarPath -C $PSScriptRoot Dockerfile go.mod main.go docker-compose.yml
 
@@ -188,9 +188,9 @@ try {
     Write-Host "Portainer raw response: $deployRespRaw" -ForegroundColor Yellow
 }
 
-# Ensure my-vpn-2_vpn (gluetun) is stopped initially since default mode is Direct (Local ISP)
+# Ensure my-vpn-2-vpn (gluetun) is stopped initially since default mode is Direct (Local ISP)
 Start-Sleep -Seconds 3
-& curl.exe -k -s -X POST -H "X-API-Key: $apiKey" "$portainerUrl/api/endpoints/$endpointId/docker/containers/my-vpn-2_vpn/stop?t=5" | Out-Null
+& curl.exe -k -s -X POST -H "X-API-Key: $apiKey" "$portainerUrl/api/endpoints/$endpointId/docker/containers/my-vpn-2-vpn/stop?t=5" | Out-Null
 
 # Verify Web UI & Proxy Health
 Write-Host "`nVerifying my-vpn-2 Web UI ($webUrl) and Proxy ($proxyUrl)..." -ForegroundColor Cyan
