@@ -79,8 +79,8 @@ Gluetun requires the Linux TUN kernel driver (`/dev/net/tun`).
 - **PAC Auto-Config URL**: `http://<YOUR_NAS_IP>:<WEB_PORT>/proxy.pac`
 
 ### Updating to the Latest Image
-Whenever a new commit is pushed to `main` and GitHub Actions finishes publishing `ghcr.io/freakingprime/my-vpn-2:latest`:
+Because `pull_policy: always` is configured in `docker-compose.yml`, Container Manager will automatically check GitHub Container Registry and download the newest image whenever you build:
 1. Open DSM **Container Manager** $\rightarrow$ **Project**.
-2. Select `my-vpn-2` $\rightarrow$ Click **Action** $\rightarrow$ **Rebuild**.
-3. In the confirmation dialog, check **"Pull the latest image from the registry"** and click **Rebuild**.
-4. Container Manager will download the updated image and recreate the container in ~5 seconds.
+2. Select `my-vpn-2` $\rightarrow$ Click **Action** $\rightarrow$ **Stop**.
+3. Click **Action** $\rightarrow$ **Build** (or **Clean** then **Build**).
+4. Container Manager will automatically pull the newest `:latest` image from `ghcr.io` and start the updated container.

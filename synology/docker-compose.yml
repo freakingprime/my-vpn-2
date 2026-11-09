@@ -1,6 +1,7 @@
 services:
   controller:
     image: ghcr.io/freakingprime/my-vpn-2:latest
+    pull_policy: always
     container_name: my-vpn-2_controller
     user: "0:0"
     restart: unless-stopped
