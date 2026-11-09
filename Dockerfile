@@ -3,11 +3,12 @@ FROM golang:1.23-alpine AS builder
 WORKDIR /src
 RUN apk add --no-cache git ca-certificates
 
-COPY go.mod ./
+COPY go.mod go.sum ./
 COPY main.go ./
 
-RUN go mod tidy && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /my-vpn-2 main.go
+ARG BUILD_TIME
+RUN if [ -z "$BUILD_TIME" ]; then BUILD_TIME=$(date -u +'%Y-%m-%d %H:%M UTC'); fi && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X 'main.BuildTime=${BUILD_TIME}'" -o /my-vpn-2 main.go
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata

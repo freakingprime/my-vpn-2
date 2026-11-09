@@ -30,6 +30,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Get current build timestamp
+        id: time
+        run: echo "build_time=$(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_OUTPUT
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -38,5 +42,7 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            BUILD_TIME=${{ steps.time.outputs.build_time }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,6 +45,7 @@ const (
 )
 
 var (
+	BuildTime        = ""
 	dataDir          = getEnv("DATA_DIR", "/data")
 	webPort          = getEnv("WEB_PORT", "8080")
 	proxyPort        = getEnv("PROXY_PORT", "8888")
@@ -61,6 +63,24 @@ var (
 
 	privateCIDRs []*net.IPNet
 )
+
+func getBuildTime() string {
+	if BuildTime != "" && BuildTime != "unknown" {
+		return BuildTime
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.time" {
+				t, err := time.Parse(time.RFC3339, setting.Value)
+				if err == nil {
+					return t.UTC().Format("2006-01-02 15:04 UTC")
+				}
+				return setting.Value
+			}
+		}
+	}
+	return "dev (" + time.Now().UTC().Format("2006-01-02") + ")"
+}
 
 func init() {
 	for _, cidr := range []string{
@@ -1125,7 +1145,23 @@ const htmlTemplate = `<!DOCTYPE html>
             gap: 12px;
             margin-bottom: 18px;
         }
+        .title-area {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
         h1 { margin: 0; color: var(--blue); font-size: 24px; }
+        .build-badge {
+            background: rgba(137, 180, 250, 0.15);
+            color: var(--blue);
+            border: 1px solid rgba(137, 180, 250, 0.35);
+            padding: 3px 9px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+        }
         .proxy-pill {
             background: var(--surface);
             border: 1px solid var(--blue);
@@ -1279,7 +1315,10 @@ const htmlTemplate = `<!DOCTYPE html>
 </head>
 <body>
     <div class="header-bar">
-        <h1>my-vpn-2 — Multi-Target Proxy Gateway</h1>
+        <div class="title-area">
+            <h1>my-vpn-2 — Multi-Target Proxy Gateway</h1>
+            <span class="build-badge" title="Container Build Timestamp">Build: {{ .BuildTime }}</span>
+        </div>
         <div class="proxy-pill">
             HTTP / HTTPS Proxy: <code id="proxyAddrText">{{ .HostIP }}:{{ .ProxyPort }}</code>
             &nbsp;|&nbsp; PAC URL: <code>http://{{ .HostIP }}:{{ .WebPort }}/proxy.pac</code>
@@ -1717,6 +1756,7 @@ func setupWebRoutes(c *Controller) http.Handler {
 		}
 
 		data := map[string]interface{}{
+			"BuildTime":      getBuildTime(),
 			"HostIP":         hostIP,
 			"WebPort":        webPort,
 			"ProxyPort":      proxyPort,
@@ -1774,6 +1814,7 @@ func setupWebRoutes(c *Controller) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"ok":              true,
+			"buildTime":       getBuildTime(),
 			"activeMode":      mode,
 			"isTransitioning": transitioning,
 			"vpngateIP":       vpngateIP,

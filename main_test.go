@@ -48,6 +48,27 @@ func TestPAC(t *testing.T) {
 	}
 }
 
+// TestWebUIHeader verifies that the web dashboard renders with the build time badge
+func TestWebUIHeader(t *testing.T) {
+	ctrl := NewController()
+	handler := setupWebRoutes(ctrl)
+
+	req := httptest.NewRequest("GET", "http://localhost:8080/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	if !strings.Contains(bodyStr, "Build: ") {
+		t.Errorf("expected 'Build: ' in web header HTML, got: %s", bodyStr)
+	}
+}
+
 // TestAPIStatus verifies that /api/status returns the correct JSON payload
 func TestAPIStatus(t *testing.T) {
 	ctrl := NewController()
@@ -72,6 +93,9 @@ func TestAPIStatus(t *testing.T) {
 	}
 	if data["ok"] != true {
 		t.Errorf("expected ok: true, got %v", data["ok"])
+	}
+	if data["buildTime"] == nil || data["buildTime"] == "" {
+		t.Errorf("expected non-empty buildTime, got %v", data["buildTime"])
 	}
 }
 
