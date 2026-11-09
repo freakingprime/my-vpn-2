@@ -496,6 +496,8 @@ func (c *Controller) SwitchToVPNGate(ip, country, b64Config string) error {
 	if err := os.WriteFile(confPath, []byte(cfgText), 0644); err != nil {
 		c.mu.Lock()
 		c.activeMode = ModeNUC
+		c.vpngateServerIP = ""
+		c.vpngateCountry = ""
 		c.isTransitioning = false
 		c.transitionStatus = ""
 		c.mu.Unlock()
@@ -515,6 +517,8 @@ func (c *Controller) SwitchToVPNGate(ip, country, b64Config string) error {
 	if err := startOrRestartGluetun(); err != nil {
 		c.mu.Lock()
 		c.activeMode = ModeNUC
+		c.vpngateServerIP = ""
+		c.vpngateCountry = ""
 		c.isTransitioning = false
 		c.transitionStatus = ""
 		c.mu.Unlock()
@@ -1046,7 +1050,7 @@ func (c *Controller) recordExitHistory(serverIP string, info *IPInfo) {
 
 // --- HTTP/HTTPS Proxy Server (elazarl/goproxy) ---
 
-func startProxyServer(c *Controller) {
+func setupProxyHandler(c *Controller) http.Handler {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = false
 
@@ -1066,14 +1070,17 @@ func startProxyServer(c *Controller) {
 	}
 
 	// Enforce Private LAN & Tailscale IP Whitelist
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !isPrivateIP(r.RemoteAddr) {
 			http.Error(w, "Forbidden: Proxy restricted to private LAN and Tailscale subnets.", http.StatusForbidden)
 			return
 		}
 		proxy.ServeHTTP(w, r)
 	})
+}
 
+func startProxyServer(c *Controller) {
+	handler := setupProxyHandler(c)
 	addr := ":" + proxyPort
 	log.Printf("[PROXY] Starting HTTP/HTTPS CONNECT Proxy on %s", addr)
 	if err := http.ListenAndServe(addr, handler); err != nil {
@@ -1673,7 +1680,7 @@ func formatDurationShort(d time.Duration) string {
 	return fmt.Sprintf("%dh %dm", hrs, mins%60)
 }
 
-func startWebServer(c *Controller) {
+func setupWebRoutes(c *Controller) http.Handler {
 	tmpl := template.Must(template.New("index").Parse(htmlTemplate))
 	mux := http.NewServeMux()
 
@@ -1984,6 +1991,11 @@ func startWebServer(c *Controller) {
 	// Suppress unused import warning for url package if any
 	_ = url.PathEscape
 
+	return mux
+}
+
+func startWebServer(c *Controller) {
+	mux := setupWebRoutes(c)
 	addr := ":" + webPort
 	log.Printf("[WEB] Starting Web Dashboard on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {

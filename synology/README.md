@@ -81,4 +81,6 @@ Gluetun requires the Linux TUN kernel driver (`/dev/net/tun`).
 ### Updating to the Latest Image
 Whenever a new commit is pushed to `main` and GitHub Actions finishes publishing `ghcr.io/freakingprime/my-vpn-2:latest`:
 1. Open DSM **Container Manager** $\rightarrow$ **Project**.
-2. Select `my-vpn-2` $\rightarrow$ Click **Action** $\rightarrow$ **Clean and Build** (or **Rebuild**).
+2. Select `my-vpn-2` $\rightarrow$ Click **Action** $\rightarrow$ **Rebuild**.
+3. In the confirmation dialog, check **"Pull the latest image from the registry"** and click **Rebuild**.
+4. Container Manager will download the updated image and recreate the container in ~5 seconds.
