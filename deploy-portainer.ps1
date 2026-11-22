@@ -13,11 +13,15 @@ $portainerUrl = if ($env:PORTAINER_URL) { $env:PORTAINER_URL } else { "https://l
 $endpointId = if ($env:PORTAINER_ENDPOINT_ID) { [int]$env:PORTAINER_ENDPOINT_ID } else { 1 }
 $nucDataDir = if ($env:NUC_DATA_DIR) { $env:NUC_DATA_DIR } else { "/opt/my-vpn-2" }
 $localSshKeyPath = if ($env:LOCAL_SSH_KEY_PATH) { $env:LOCAL_SSH_KEY_PATH } else { (Join-Path $env:USERPROFILE ".ssh\id_rsa") }
+$localOciSshKeyPath = if ($env:LOCAL_OCI_SSH_KEY_PATH) { $env:LOCAL_OCI_SSH_KEY_PATH } else { "" }
 $webPort = if ($env:WEB_PORT) { $env:WEB_PORT } else { "8080" }
 $proxyPort = if ($env:PROXY_PORT) { $env:PROXY_PORT } else { "8888" }
 $gceHost = if ($env:GCE_HOST) { $env:GCE_HOST } else { "203.0.113.10:22" }
 $gceUser = if ($env:GCE_USER) { $env:GCE_USER } else { "cloud-user" }
 $gceKeyPath = if ($env:GCE_KEY_PATH) { $env:GCE_KEY_PATH } else { "/data/id_rsa" }
+$ociHost = if ($env:OCI_HOST) { $env:OCI_HOST } else { "203.0.113.20:22" }
+$ociUser = if ($env:OCI_USER) { $env:OCI_USER } else { "ubuntu" }
+$ociKeyPath = if ($env:OCI_KEY_PATH) { $env:OCI_KEY_PATH } else { "" }
 
 if (Test-Path $envFile) {
     Get-Content $envFile | ForEach-Object {
@@ -31,14 +35,19 @@ if (Test-Path $envFile) {
             elseif ($k -eq "PORTAINER_ENDPOINT_ID") { $endpointId = [int]$v }
             elseif ($k -eq "NUC_DATA_DIR") { $nucDataDir = $v }
             elseif ($k -eq "LOCAL_SSH_KEY_PATH") { $localSshKeyPath = $v }
+            elseif ($k -eq "LOCAL_OCI_SSH_KEY_PATH") { $localOciSshKeyPath = $v }
             elseif ($k -eq "WEB_PORT") { $webPort = $v }
             elseif ($k -eq "PROXY_PORT") { $proxyPort = $v }
             elseif ($k -eq "GCE_HOST") { $gceHost = $v }
             elseif ($k -eq "GCE_USER") { $gceUser = $v }
             elseif ($k -eq "GCE_KEY_PATH") { $gceKeyPath = $v }
+            elseif ($k -eq "OCI_HOST") { $ociHost = $v }
+            elseif ($k -eq "OCI_USER") { $ociUser = $v }
+            elseif ($k -eq "OCI_KEY_PATH") { $ociKeyPath = $v }
         }
     }
 }
+if (-not $ociKeyPath) { $ociKeyPath = $gceKeyPath }
 
 if (-not $apiKey) {
     Write-Host "PORTAINER_API_KEY not found in .env or environment variables." -ForegroundColor Yellow
@@ -92,10 +101,21 @@ if (-not (Test-Path $localSshKeyPath)) {
 $keyB64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($localSshKeyPath))
 $keyFileName = [System.IO.Path]::GetFileName($gceKeyPath)
 
-$runtimeEnvText = "WEB_PORT=$webPort`nPROXY_PORT=$proxyPort`nGCE_HOST=$gceHost`nGCE_USER=$gceUser`nGCE_KEY_PATH=$gceKeyPath`n"
+$ociKeyCmd = ""
+if ($localOciSshKeyPath) {
+    if (-not (Test-Path $localOciSshKeyPath)) {
+        Write-Host "ERROR: Oracle Cloud SSH private key not found at $localOciSshKeyPath" -ForegroundColor Red
+        exit 1
+    }
+    $ociKeyB64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($localOciSshKeyPath))
+    $ociKeyFileName = [System.IO.Path]::GetFileName($ociKeyPath)
+    $ociKeyCmd = " && echo '$ociKeyB64' | base64 -d > /host_data/$ociKeyFileName && chmod 600 /host_data/$ociKeyFileName"
+}
+
+$runtimeEnvText = "WEB_PORT=$webPort`nPROXY_PORT=$proxyPort`nGCE_HOST=$gceHost`nGCE_USER=$gceUser`nGCE_KEY_PATH=$gceKeyPath`nOCI_HOST=$ociHost`nOCI_USER=$ociUser`nOCI_KEY_PATH=$ociKeyPath`n"
 $envB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($runtimeEnvText))
 
-$prepCmd = "mkdir -p /host_data && echo '$keyB64' | base64 -d > /host_data/$keyFileName && chmod 600 /host_data/$keyFileName && echo '$envB64' | base64 -d > /host_data/.env && chmod 600 /host_data/.env && touch /host_data/custom.conf && ls -la /host_data"
+$prepCmd = "mkdir -p /host_data && echo '$keyB64' | base64 -d > /host_data/$keyFileName && chmod 600 /host_data/$keyFileName$ociKeyCmd && echo '$envB64' | base64 -d > /host_data/.env && chmod 600 /host_data/.env && touch /host_data/custom.conf && ls -la /host_data"
 $prepObj = @{
     Image = "python:3.11-alpine"
     Entrypoint = @("sh", "-c")
@@ -169,7 +189,10 @@ $stackBodyObj = @{
         @{ name = "PROXY_PORT"; value = $proxyPort },
         @{ name = "GCE_HOST"; value = $gceHost },
         @{ name = "GCE_USER"; value = $gceUser },
-        @{ name = "GCE_KEY_PATH"; value = $gceKeyPath }
+        @{ name = "GCE_KEY_PATH"; value = $gceKeyPath },
+        @{ name = "OCI_HOST"; value = $ociHost },
+        @{ name = "OCI_USER"; value = $ociUser },
+        @{ name = "OCI_KEY_PATH"; value = $ociKeyPath }
     )
 }
 $tmpStack = [System.IO.Path]::GetTempFileName()

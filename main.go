@@ -34,6 +34,7 @@ import (
 const (
 	ModeNUC     = "nuc"
 	ModeGCE     = "gce"
+	ModeOCI     = "oci"
 	ModeVPNGate = "vpngate"
 
 	VPNGateAPIURL        = "http://www.vpngate.net/api/iphone/"
@@ -52,6 +53,9 @@ var (
 	gceHost          = getEnv("GCE_HOST", "203.0.113.10:22")
 	gceUser          = getEnv("GCE_USER", "cloud-user")
 	gceKeyPath       = getEnv("GCE_KEY_PATH", "/data/id_rsa")
+	ociHost          = getEnv("OCI_HOST", "203.0.113.20:22")
+	ociUser          = getEnv("OCI_USER", "ubuntu")
+	ociKeyPath       = getEnv("OCI_KEY_PATH", gceKeyPath)
 	gluetunContainer = getEnv("GLUETUN_CONTAINER", "my-vpn-2-vpn")
 	gluetunProxyAddr = getEnv("GLUETUN_PROXY_ADDR", "127.0.0.1:18888")
 	dockerSockPath   = getEnv("DOCKER_SOCK", "/var/run/docker.sock")
@@ -105,6 +109,17 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func normalizeSSHHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	return net.JoinHostPort(strings.Trim(host, "[]"), "22")
 }
 
 func isPrivateIP(RemoteAddr string) bool {
@@ -170,14 +185,16 @@ type HistoryEntry struct {
 
 type Controller struct {
 	mu               sync.RWMutex
-	activeMode       string // ModeNUC, ModeGCE, ModeVPNGate
+	activeMode       string // ModeNUC, ModeGCE, ModeOCI, ModeVPNGate
 	isTransitioning  bool   // Fail-closed flag during mode transitions
 	transitionStatus string
 	vpngateServerIP  string
 	vpngateCountry   string
 
-	sshMu     sync.Mutex
-	sshClient *ssh.Client
+	sshMu          sync.Mutex
+	sshClient      *ssh.Client
+	sshTarget      string
+	sshTargetLabel string
 
 	lastActivityUnix atomic.Int64
 
@@ -290,35 +307,81 @@ func startOrRestartGluetun() error {
 	return nil
 }
 
-// --- GCE SSH On-Demand Client ---
+// --- Cloud VM SSH On-Demand Client (GCE & Oracle Cloud) ---
+
+type sshTargetConfig struct {
+	mode    string
+	label   string
+	host    string
+	user    string
+	keyPath string
+}
+
+func getSSHTargetConfig(mode string) (sshTargetConfig, error) {
+	switch mode {
+	case ModeGCE:
+		return sshTargetConfig{
+			mode:    ModeGCE,
+			label:   "Google Cloud VM",
+			host:    normalizeSSHHost(gceHost),
+			user:    gceUser,
+			keyPath: gceKeyPath,
+		}, nil
+	case ModeOCI:
+		return sshTargetConfig{
+			mode:    ModeOCI,
+			label:   "Oracle Cloud VM",
+			host:    normalizeSSHHost(ociHost),
+			user:    ociUser,
+			keyPath: ociKeyPath,
+		}, nil
+	default:
+		return sshTargetConfig{}, fmt.Errorf("unsupported SSH mode: %s", mode)
+	}
+}
 
 func (c *Controller) closeSSH() {
 	c.sshMu.Lock()
 	defer c.sshMu.Unlock()
 	if c.sshClient != nil {
+		label := c.sshTargetLabel
+		if label == "" {
+			label = "VM"
+		}
 		c.sshClient.Close()
 		c.sshClient = nil
-		log.Println("[SSH] Disconnected from GCE VM.")
+		c.sshTarget = ""
+		c.sshTargetLabel = ""
+		log.Printf("[SSH] Disconnected from %s.", label)
 	}
 }
 
-func (c *Controller) ensureSSHConnected() (*ssh.Client, error) {
+func (c *Controller) ensureSSHConnected(mode string) (*ssh.Client, error) {
+	target, err := getSSHTargetConfig(mode)
+	if err != nil {
+		return nil, err
+	}
+
 	c.sshMu.Lock()
 	defer c.sshMu.Unlock()
 
 	if c.sshClient != nil {
-		// Quick keepalive check
-		_, _, err := c.sshClient.SendRequest("keepalive@openssh.com", true, nil)
-		if err == nil {
-			return c.sshClient, nil
+		if c.sshTarget == target.mode {
+			// Quick keepalive check
+			_, _, err := c.sshClient.SendRequest("keepalive@openssh.com", true, nil)
+			if err == nil {
+				return c.sshClient, nil
+			}
 		}
 		c.sshClient.Close()
 		c.sshClient = nil
+		c.sshTarget = ""
+		c.sshTargetLabel = ""
 	}
 
-	keyBytes, err := os.ReadFile(gceKeyPath)
+	keyBytes, err := os.ReadFile(target.keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read SSH key at %s: %w", gceKeyPath, err)
+		return nil, fmt.Errorf("cannot read SSH key at %s: %w", target.keyPath, err)
 	}
 	signer, err := ssh.ParsePrivateKey(keyBytes)
 	if err != nil {
@@ -326,7 +389,7 @@ func (c *Controller) ensureSSHConnected() (*ssh.Client, error) {
 	}
 
 	cfg := &ssh.ClientConfig{
-		User: gceUser,
+		User: target.user,
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
@@ -334,13 +397,15 @@ func (c *Controller) ensureSSHConnected() (*ssh.Client, error) {
 		Timeout:         12 * time.Second,
 	}
 
-	log.Printf("[SSH] Dialing GCE VM %s@%s...", gceUser, gceHost)
-	client, err := ssh.Dial("tcp", gceHost, cfg)
+	log.Printf("[SSH] Dialing %s %s@%s...", target.label, target.user, target.host)
+	client, err := ssh.Dial("tcp", target.host, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("SSH dial to %s failed: %w", gceHost, err)
+		return nil, fmt.Errorf("SSH dial to %s (%s) failed: %w", target.label, target.host, err)
 	}
 	c.sshClient = client
-	log.Printf("[SSH] Successfully connected to GCE VM %s!", gceHost)
+	c.sshTarget = target.mode
+	c.sshTargetLabel = target.label
+	log.Printf("[SSH] Successfully connected to %s %s!", target.label, target.host)
 	return client, nil
 }
 
@@ -391,9 +456,16 @@ func (c *Controller) dialUpstream(ctx context.Context, network, addr string) (ne
 		return d.DialContext(ctx, network, addr)
 
 	case ModeGCE:
-		sshCli, err := c.ensureSSHConnected()
+		sshCli, err := c.ensureSSHConnected(ModeGCE)
 		if err != nil {
 			return nil, fmt.Errorf("fail-closed (GCE SSH error): %w", err)
+		}
+		return sshCli.Dial(network, addr)
+
+	case ModeOCI:
+		sshCli, err := c.ensureSSHConnected(ModeOCI)
+		if err != nil {
+			return nil, fmt.Errorf("fail-closed (OCI SSH error): %w", err)
 		}
 		return sshCli.Dial(network, addr)
 
@@ -434,18 +506,26 @@ func (c *Controller) SwitchToNUC() error {
 	return nil
 }
 
-func (c *Controller) SwitchToGCE() error {
+func (c *Controller) switchToSSH(mode string) error {
+	target, err := getSSHTargetConfig(mode)
+	if err != nil {
+		return err
+	}
+
 	c.mu.Lock()
 	c.isTransitioning = true
-	c.transitionStatus = fmt.Sprintf("Connecting on-demand SSH tunnel to Google Cloud VM (%s)...", gceHost)
+	c.transitionStatus = fmt.Sprintf("Connecting on-demand SSH tunnel to %s (%s)...", target.label, target.host)
 	c.mu.Unlock()
 
+	c.closeSSH()
 	stopGluetunContainer()
 
-	_, err := c.ensureSSHConnected()
+	_, err = c.ensureSSHConnected(mode)
 	if err != nil {
 		c.mu.Lock()
 		c.activeMode = ModeNUC
+		c.vpngateServerIP = ""
+		c.vpngateCountry = ""
 		c.isTransitioning = false
 		c.transitionStatus = ""
 		c.mu.Unlock()
@@ -453,7 +533,7 @@ func (c *Controller) SwitchToGCE() error {
 	}
 
 	c.mu.Lock()
-	c.activeMode = ModeGCE
+	c.activeMode = mode
 	c.vpngateServerIP = ""
 	c.vpngateCountry = ""
 	c.isTransitioning = false
@@ -462,8 +542,16 @@ func (c *Controller) SwitchToGCE() error {
 
 	c.touchActivity()
 	c.refreshIPStatus(true)
-	log.Printf("[MODE] Active target switched to GCE VM (%s).", gceHost)
+	log.Printf("[MODE] Active target switched to %s (%s).", target.label, target.host)
 	return nil
+}
+
+func (c *Controller) SwitchToGCE() error {
+	return c.switchToSSH(ModeGCE)
+}
+
+func (c *Controller) SwitchToOCI() error {
+	return c.switchToSSH(ModeOCI)
 }
 
 func buildOpenVPNConfig(b64 string) (string, error) {
@@ -508,7 +596,7 @@ func (c *Controller) SwitchToVPNGate(ip, country, b64Config string) error {
 	c.transitionStatus = fmt.Sprintf("Starting Gluetun & connecting to VPNGate %s (%s)...", ip, country)
 	c.mu.Unlock()
 
-	// Close GCE SSH if active
+	// Close any active VM SSH tunnel (GCE or Oracle Cloud)
 	c.closeSSH()
 
 	// Write /data/custom.conf
@@ -1176,7 +1264,7 @@ const htmlTemplate = `<!DOCTYPE html>
         }
         .targets-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
             gap: 14px;
             margin-bottom: 18px;
         }
@@ -1327,7 +1415,7 @@ const htmlTemplate = `<!DOCTYPE html>
 
     <div id="banner"></div>
 
-    <!-- 3 Selectable Target Mode Cards -->
+    <!-- 4 Selectable Target Mode Cards -->
     <div class="targets-grid">
         <div class="target-card {{ if eq .ActiveMode "nuc" }}active{{ end }}" id="card-nuc">
             <div>
@@ -1338,7 +1426,7 @@ const htmlTemplate = `<!DOCTYPE html>
                     </span>
                 </div>
                 <div class="target-desc">
-                    Routes proxy traffic directly out through your local ISP connection. Both GCE SSH and Gluetun sleep (0 background resources).
+                    Routes proxy traffic directly out through your local ISP connection. All SSH tunnels and Gluetun sleep (0 background resources).
                 </div>
             </div>
             <button class="btn {{ if eq .ActiveMode "nuc" }}btn-blue{{ end }}" onclick="switchMode('nuc')" {{ if eq .ActiveMode "nuc" }}disabled{{ end }}>
@@ -1363,10 +1451,27 @@ const htmlTemplate = `<!DOCTYPE html>
             </button>
         </div>
 
+        <div class="target-card {{ if eq .ActiveMode "oci" }}active{{ end }}" id="card-oci">
+            <div>
+                <div class="target-header">
+                    <span class="target-title">3. Oracle Cloud VM (SSH Tunnel)</span>
+                    <span class="badge {{ if eq .ActiveMode "oci" }}badge-active{{ else }}badge-standby{{ end }}">
+                        {{ if eq .ActiveMode "oci" }}ACTIVE{{ else }}ON-DEMAND{{ end }}
+                    </span>
+                </div>
+                <div class="target-desc">
+                    Establishes an encrypted on-demand SSH tunnel to <code>{{ .OCIHost }}</code>.
+                </div>
+            </div>
+            <button class="btn {{ if eq .ActiveMode "oci" }}btn-blue{{ end }}" onclick="switchMode('oci')" {{ if eq .ActiveMode "oci" }}disabled{{ end }}>
+                {{ if eq .ActiveMode "oci" }}Currently Active{{ else }}Connect Oracle SSH Tunnel{{ end }}
+            </button>
+        </div>
+
         <div class="target-card {{ if eq .ActiveMode "vpngate" }}active{{ end }}" id="card-vpngate">
             <div>
                 <div class="target-header">
-                    <span class="target-title">3. VPNGate Volunteer Server</span>
+                    <span class="target-title">4. VPNGate Volunteer Server</span>
                     <span class="badge {{ if eq .ActiveMode "vpngate" }}badge-active{{ else }}badge-standby{{ end }}" id="badge-vpngate">
                         {{ if eq .ActiveMode "vpngate" }}ACTIVE{{ else }}ON-DEMAND{{ end }}
                     </span>
@@ -1412,7 +1517,7 @@ const htmlTemplate = `<!DOCTYPE html>
             <div class="stat-label">4-Hour Inactivity Auto-Shutoff</div>
             {{ if eq .ActiveMode "nuc" }}
                 <div class="stat-val good">Sleeping (0 VPN/SSH Load)</div>
-                <div class="stat-sub">Timer starts when GCE or VPNGate is active</div>
+                <div class="stat-sub">Timer starts when GCE, Oracle Cloud, or VPNGate is active</div>
             {{ else }}
                 <div class="stat-val warn">{{ .IdleRemaining }}</div>
                 <div class="stat-sub">Resets automatically on any proxy traffic</div>
@@ -1559,9 +1664,13 @@ const htmlTemplate = `<!DOCTYPE html>
 
         async function switchMode(mode) {
             setAllButtonsDisabled(true);
-            showBanner(mode === 'gce'
-                ? 'Establishing encrypted SSH tunnel to Google Cloud VM ({{ .GCEHost }})...'
-                : 'Switching to Direct (Local ISP) and stopping background tunnels...', '');
+            let bannerMsg = 'Switching to Direct (Local ISP) and stopping background tunnels...';
+            if (mode === 'gce') {
+                bannerMsg = 'Establishing encrypted SSH tunnel to Google Cloud VM ({{ .GCEHost }})...';
+            } else if (mode === 'oci') {
+                bannerMsg = 'Establishing encrypted SSH tunnel to Oracle Cloud VM ({{ .OCIHost }})...';
+            }
+            showBanner(bannerMsg, '');
             try {
                 const res = await fetch('/api/mode', {
                     method: 'POST',
@@ -1760,7 +1869,8 @@ func setupWebRoutes(c *Controller) http.Handler {
 			"HostIP":         hostIP,
 			"WebPort":        webPort,
 			"ProxyPort":      proxyPort,
-			"GCEHost":        gceHost,
+			"GCEHost":        normalizeSSHHost(gceHost),
+			"OCIHost":        normalizeSSHHost(ociHost),
 			"ActiveMode":     activeMode,
 			"VPNGateIP":      vpngateIP,
 			"VPNGateCountry": vpngateCountry,
@@ -1825,7 +1935,7 @@ func setupWebRoutes(c *Controller) http.Handler {
 		})
 	})
 
-	// Switch Mode (Direct Local ISP or GCE SSH Tunnel)
+	// Switch Mode (Direct Local ISP, GCE SSH Tunnel, or Oracle Cloud SSH Tunnel)
 	mux.HandleFunc("/api/mode", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1857,13 +1967,28 @@ func setupWebRoutes(c *Controller) http.Handler {
 				return
 			}
 			exitInfo, _, _ := c.refreshIPStatus(false)
-			exitStr := gceHost
+			exitStr := normalizeSSHHost(gceHost)
 			if exitInfo != nil {
 				exitStr = fmt.Sprintf("%s (%s)", exitInfo.IP, exitInfo.Place)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"ok":      true,
 				"message": fmt.Sprintf("Connected to Google Cloud VM! Proxy now exits at %s.", exitStr),
+			})
+		case ModeOCI:
+			if err := c.SwitchToOCI(); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+				return
+			}
+			exitInfo, _, _ := c.refreshIPStatus(false)
+			exitStr := normalizeSSHHost(ociHost)
+			if exitInfo != nil {
+				exitStr = fmt.Sprintf("%s (%s)", exitInfo.IP, exitInfo.Place)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":      true,
+				"message": fmt.Sprintf("Connected to Oracle Cloud VM! Proxy now exits at %s.", exitStr),
 			})
 		default:
 			w.WriteHeader(http.StatusBadRequest)

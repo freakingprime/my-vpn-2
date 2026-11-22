@@ -12,8 +12,8 @@ In Synology **File Station**, create `/volume1/docker/my-vpn-2`:
 /volume1/docker/
 └── my-vpn-2/
     ├── docker-compose.yml       <-- From synology/docker-compose.yml
-    ├── .env                     <-- Environment configuration (ports & SSH target)
-    ├── id_rsa                   <-- SSH private key (OpenSSH PEM format, chmod 600)
+    ├── .env                     <-- Environment configuration (ports & SSH targets)
+    ├── id_rsa                   <-- SSH private key (OpenSSH PEM format, chmod 600; add a 2nd key if GCE & OCI differ)
     ├── custom.conf              <-- Auto-managed standby config for Gluetun
     └── exit_history.json        <-- Auto-managed state file
 ```
@@ -32,6 +32,9 @@ PROXY_PORT=8888
 GCE_HOST=203.0.113.10:22
 GCE_USER=cloud-user
 GCE_KEY_PATH=/data/id_rsa
+OCI_HOST=203.0.113.20:22
+OCI_USER=ubuntu
+OCI_KEY_PATH=/data/id_rsa
 ```
 
 ### B. Compose File: `/volume1/docker/my-vpn-2/docker-compose.yml`

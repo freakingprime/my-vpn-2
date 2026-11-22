@@ -67,6 +67,9 @@ func TestWebUIHeader(t *testing.T) {
 	if !strings.Contains(bodyStr, "Build: ") {
 		t.Errorf("expected 'Build: ' in web header HTML, got: %s", bodyStr)
 	}
+	if !strings.Contains(bodyStr, "Oracle Cloud VM (SSH Tunnel)") {
+		t.Errorf("expected Oracle Cloud VM target card in web UI HTML")
+	}
 }
 
 // TestAPIStatus verifies that /api/status returns the correct JSON payload
@@ -517,3 +520,198 @@ func TestCountryGroupingAndSorting(t *testing.T) {
 		t.Errorf("unexpected sorting within Japan: %+v", japanServers)
 	}
 }
+
+// TestNormalizeSSHHost verifies default port :22 handling for SSH hosts
+func TestNormalizeSSHHost(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"203.0.113.20:22", "203.0.113.20:22"},
+		{"203.0.113.20:2222", "203.0.113.20:2222"},
+		{"203.0.113.20", "203.0.113.20:22"},
+		{" 203.0.113.20 ", "203.0.113.20:22"},
+		{"[::1]:2222", "[::1]:2222"},
+		{"::1", "[::1]:22"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := normalizeSSHHost(tt.in); got != tt.want {
+			t.Errorf("normalizeSSHHost(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func startMockSSHForwardServer(t *testing.T, expectedUser string) (string, string, func()) {
+	t.Helper()
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed generating RSA key: %v", err)
+	}
+	privKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privKey),
+	})
+
+	keyPath := filepath.Join(t.TempDir(), "test_id_rsa")
+	if err := os.WriteFile(keyPath, privKeyPEM, 0600); err != nil {
+		t.Fatalf("failed writing test key: %v", err)
+	}
+
+	signer, err := ssh.ParsePrivateKey(privKeyPEM)
+	if err != nil {
+		t.Fatalf("failed parsing private key: %v", err)
+	}
+
+	sshConfig := &ssh.ServerConfig{
+		NoClientAuth: false,
+		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if expectedUser != "" && conn.User() != expectedUser {
+				return nil, fmt.Errorf("unexpected user %s", conn.User())
+			}
+			return nil, nil
+		},
+	}
+	sshConfig.AddHostKey(signer)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed starting SSH listener: %v", err)
+	}
+
+	go func() {
+		for {
+			nConn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				sConn, chans, reqs, err := ssh.NewServerConn(c, sshConfig)
+				if err != nil {
+					return
+				}
+				defer sConn.Close()
+				go ssh.DiscardRequests(reqs)
+
+				for newChannel := range chans {
+					if newChannel.ChannelType() != "direct-tcpip" {
+						_ = newChannel.Reject(ssh.UnknownChannelType, "unsupported")
+						continue
+					}
+					var d struct {
+						DestAddr string
+						DestPort uint32
+						OrigAddr string
+						OrigPort uint32
+					}
+					_ = ssh.Unmarshal(newChannel.ExtraData(), &d)
+					dest := fmt.Sprintf("%s:%d", d.DestAddr, d.DestPort)
+					upstream, err := net.Dial("tcp", dest)
+					if err != nil {
+						_ = newChannel.Reject(ssh.ConnectionFailed, err.Error())
+						continue
+					}
+					ch, reqs2, err := newChannel.Accept()
+					if err != nil {
+						upstream.Close()
+						continue
+					}
+					go ssh.DiscardRequests(reqs2)
+					go func() {
+						defer ch.Close()
+						defer upstream.Close()
+						_, _ = io.Copy(ch, upstream)
+					}()
+					go func() {
+						defer ch.Close()
+						defer upstream.Close()
+						_, _ = io.Copy(upstream, ch)
+					}()
+				}
+			}(nConn)
+		}
+	}()
+
+	return listener.Addr().String(), keyPath, func() { _ = listener.Close() }
+}
+
+// TestMockOCISSHServer tests Oracle Cloud SSH tunnel mode, /api/mode switching, and GCE <-> OCI transitions
+func TestMockOCISSHServer(t *testing.T) {
+	gceAddr, gceKey, closeGCE := startMockSSHForwardServer(t, "gce-user")
+	defer closeGCE()
+	ociAddr, ociKey, closeOCI := startMockSSHForwardServer(t, "ubuntu")
+	defer closeOCI()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("oci-tunnel-ok"))
+	}))
+	defer backend.Close()
+
+	origGCEHost, origGCEKey, origGCEUser := gceHost, gceKeyPath, gceUser
+	origOCIHost, origOCIKey, origOCIUser := ociHost, ociKeyPath, ociUser
+	defer func() {
+		gceHost, gceKeyPath, gceUser = origGCEHost, origGCEKey, origGCEUser
+		ociHost, ociKeyPath, ociUser = origOCIHost, origOCIKey, origOCIUser
+	}()
+
+	gceHost, gceKeyPath, gceUser = gceAddr, gceKey, "gce-user"
+	ociHost, ociKeyPath, ociUser = ociAddr, ociKey, "ubuntu"
+
+	ctrl := NewController()
+	handler := setupWebRoutes(ctrl)
+
+	// 1. Connect to GCE first
+	if err := ctrl.SwitchToGCE(); err != nil {
+		t.Fatalf("SwitchToGCE failed: %v", err)
+	}
+	if ctrl.activeMode != ModeGCE || ctrl.sshTarget != ModeGCE {
+		t.Fatalf("expected GCE active mode/target, got mode=%s target=%s", ctrl.activeMode, ctrl.sshTarget)
+	}
+
+	// 2. Switch from GCE to Oracle Cloud via /api/mode
+	req := httptest.NewRequest("POST", "/api/mode", bytes.NewBufferString(`{"mode":"oci"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200 switching to oci, got %d: %s", resp.StatusCode, string(body))
+	}
+	var data map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatalf("failed decoding /api/mode JSON: %v", err)
+	}
+	if data["ok"] != true {
+		t.Fatalf("expected ok: true, got %v", data)
+	}
+	if ctrl.activeMode != ModeOCI || ctrl.sshTarget != ModeOCI {
+		t.Fatalf("expected OCI active mode/target, got mode=%s target=%s", ctrl.activeMode, ctrl.sshTarget)
+	}
+
+	// 3. Dial backend through Oracle Cloud SSH tunnel
+	conn, err := ctrl.dialUpstream(context.Background(), "tcp", backend.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed dialing backend through OCI SSH tunnel: %v", err)
+	}
+	defer conn.Close()
+
+	_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"))
+	respBytes, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("failed reading from OCI SSH proxied conn: %v", err)
+	}
+	if !strings.Contains(string(respBytes), "oci-tunnel-ok") {
+		t.Errorf("expected 'oci-tunnel-ok' through OCI SSH tunnel, got: %s", string(respBytes))
+	}
+
+	// 4. Revert to NUC and confirm SSH client is closed
+	if err := ctrl.SwitchToNUC(); err != nil {
+		t.Fatalf("SwitchToNUC failed: %v", err)
+	}
+	if ctrl.activeMode != ModeNUC || ctrl.sshClient != nil || ctrl.sshTarget != "" {
+		t.Fatalf("expected clean NUC state, got mode=%s sshClient=%v sshTarget=%s", ctrl.activeMode, ctrl.sshClient, ctrl.sshTarget)
+	}
+}
+
