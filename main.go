@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -195,6 +196,7 @@ type Controller struct {
 	sshClient      *ssh.Client
 	sshTarget      string
 	sshTargetLabel string
+	sshSigners     map[string]ssh.Signer
 
 	lastActivityUnix atomic.Int64
 
@@ -216,6 +218,7 @@ type Controller struct {
 func NewController() *Controller {
 	c := &Controller{
 		activeMode:  ModeNUC,
+		sshSigners:  make(map[string]ssh.Signer),
 		pingResults: make(map[string]PingResult),
 	}
 	c.touchActivity()
@@ -309,6 +312,11 @@ func startOrRestartGluetun() error {
 
 // --- Cloud VM SSH On-Demand Client (GCE & Oracle Cloud) ---
 
+var (
+	errSSHPassphraseRequired = errors.New("SSH private key is encrypted; passphrase required")
+	errSSHWrongPassphrase    = errors.New("incorrect passphrase for encrypted SSH private key")
+)
+
 type sshTargetConfig struct {
 	mode    string
 	label   string
@@ -340,6 +348,79 @@ func getSSHTargetConfig(mode string) (sshTargetConfig, error) {
 	}
 }
 
+// getKeyStatus inspects an SSH key on disk and whether it is unlocked in RAM.
+// Returns: "missing", "unencrypted", "locked", "unlocked", or "invalid".
+func (c *Controller) getKeyStatus(mode string) string {
+	target, err := getSSHTargetConfig(mode)
+	if err != nil {
+		return "invalid"
+	}
+	keyBytes, err := os.ReadFile(target.keyPath)
+	if err != nil {
+		return "missing"
+	}
+	if _, err := ssh.ParsePrivateKey(keyBytes); err == nil {
+		return "unencrypted"
+	} else {
+		var pmErr *ssh.PassphraseMissingError
+		if errors.As(err, &pmErr) {
+			c.sshMu.Lock()
+			_, unlocked := c.sshSigners[target.keyPath]
+			c.sshMu.Unlock()
+			if unlocked {
+				return "unlocked"
+			}
+			return "locked"
+		}
+		return "invalid"
+	}
+}
+
+func (c *Controller) lockAllSSHKeys() int {
+	c.sshMu.Lock()
+	count := len(c.sshSigners)
+	if count > 0 {
+		c.sshSigners = make(map[string]ssh.Signer)
+	}
+	c.sshMu.Unlock()
+	return count
+}
+
+func (c *Controller) lockSSHKey(mode string) error {
+	if mode == "" {
+		c.lockAllSSHKeys()
+		c.mu.RLock()
+		active := c.activeMode
+		c.mu.RUnlock()
+		if active == ModeGCE || active == ModeOCI {
+			return c.SwitchToNUC()
+		}
+		return nil
+	}
+
+	target, err := getSSHTargetConfig(mode)
+	if err != nil {
+		return err
+	}
+
+	c.sshMu.Lock()
+	delete(c.sshSigners, target.keyPath)
+	c.sshMu.Unlock()
+
+	c.mu.RLock()
+	active := c.activeMode
+	c.mu.RUnlock()
+	if active == mode {
+		return c.SwitchToNUC()
+	}
+	if active == ModeGCE || active == ModeOCI {
+		if activeTarget, err := getSSHTargetConfig(active); err == nil && activeTarget.keyPath == target.keyPath {
+			return c.SwitchToNUC()
+		}
+	}
+	return nil
+}
+
 func (c *Controller) closeSSH() {
 	c.sshMu.Lock()
 	defer c.sshMu.Unlock()
@@ -357,6 +438,10 @@ func (c *Controller) closeSSH() {
 }
 
 func (c *Controller) ensureSSHConnected(mode string) (*ssh.Client, error) {
+	return c.ensureSSHConnectedWithPassphrase(mode, "")
+}
+
+func (c *Controller) ensureSSHConnectedWithPassphrase(mode, passphrase string) (*ssh.Client, error) {
 	target, err := getSSHTargetConfig(mode)
 	if err != nil {
 		return nil, err
@@ -379,13 +464,37 @@ func (c *Controller) ensureSSHConnected(mode string) (*ssh.Client, error) {
 		c.sshTargetLabel = ""
 	}
 
-	keyBytes, err := os.ReadFile(target.keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read SSH key at %s: %w", target.keyPath, err)
+	var signer ssh.Signer
+	if passphrase == "" {
+		if cached, ok := c.sshSigners[target.keyPath]; ok && cached != nil {
+			signer = cached
+		}
 	}
-	signer, err := ssh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("cannot parse SSH private key: %w", err)
+
+	if signer == nil {
+		keyBytes, err := os.ReadFile(target.keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read SSH key at %s: %w", target.keyPath, err)
+		}
+		signer, err = ssh.ParsePrivateKey(keyBytes)
+		if err != nil {
+			var pmErr *ssh.PassphraseMissingError
+			if errors.As(err, &pmErr) {
+				if passphrase == "" {
+					return nil, fmt.Errorf("%w: %s", errSSHPassphraseRequired, target.keyPath)
+				}
+				signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(passphrase))
+				if err != nil {
+					return nil, fmt.Errorf("%w (%s)", errSSHWrongPassphrase, target.keyPath)
+				}
+				if c.sshSigners == nil {
+					c.sshSigners = make(map[string]ssh.Signer)
+				}
+				c.sshSigners[target.keyPath] = signer
+			} else {
+				return nil, fmt.Errorf("cannot parse SSH private key: %w", err)
+			}
+		}
 	}
 
 	cfg := &ssh.ClientConfig{
@@ -506,7 +615,7 @@ func (c *Controller) SwitchToNUC() error {
 	return nil
 }
 
-func (c *Controller) switchToSSH(mode string) error {
+func (c *Controller) switchToSSH(mode, passphrase string) error {
 	target, err := getSSHTargetConfig(mode)
 	if err != nil {
 		return err
@@ -520,7 +629,7 @@ func (c *Controller) switchToSSH(mode string) error {
 	c.closeSSH()
 	stopGluetunContainer()
 
-	_, err = c.ensureSSHConnected(mode)
+	_, err = c.ensureSSHConnectedWithPassphrase(mode, passphrase)
 	if err != nil {
 		c.mu.Lock()
 		c.activeMode = ModeNUC
@@ -547,11 +656,19 @@ func (c *Controller) switchToSSH(mode string) error {
 }
 
 func (c *Controller) SwitchToGCE() error {
-	return c.switchToSSH(ModeGCE)
+	return c.switchToSSH(ModeGCE, "")
+}
+
+func (c *Controller) SwitchToGCEWithPassphrase(passphrase string) error {
+	return c.switchToSSH(ModeGCE, passphrase)
 }
 
 func (c *Controller) SwitchToOCI() error {
-	return c.switchToSSH(ModeOCI)
+	return c.switchToSSH(ModeOCI, "")
+}
+
+func (c *Controller) SwitchToOCIWithPassphrase(passphrase string) error {
+	return c.switchToSSH(ModeOCI, passphrase)
 }
 
 func buildOpenVPNConfig(b64 string) (string, error) {
@@ -707,10 +824,13 @@ func (c *Controller) startInactivityWatchdog() {
 			transitioning := c.isTransitioning
 			c.mu.RUnlock()
 
-			if mode != ModeNUC && !transitioning {
-				if c.remainingIdleDuration() == 0 {
+			if !transitioning && c.remainingIdleDuration() == 0 {
+				if mode != ModeNUC {
 					log.Printf("[IDLE] 4 hours of inactivity elapsed in mode '%s'. Auto-reverting to Direct (Local ISP)...", mode)
 					_ = c.SwitchToNUC()
+				}
+				if c.lockAllSSHKeys() > 0 {
+					log.Println("[IDLE] Cleared unlocked SSH keys from memory after 4 hours of inactivity.")
 				}
 			}
 		}
@@ -1332,7 +1452,57 @@ const htmlTemplate = `<!DOCTYPE html>
         .btn:disabled { background-color: var(--muted); cursor: wait; opacity: 0.7; }
         .btn-blue { background-color: var(--blue); }
         .btn-yellow { background-color: var(--yellow); }
+        .btn-red { background-color: var(--red); }
         .btn-sm { padding: 6px 11px; font-size: 12px; }
+        .card-actions { display: flex; gap: 8px; align-items: center; }
+        .card-actions .btn-primary-action { flex: 1; }
+        .key-status {
+            margin-top: 8px;
+            font-size: 12px;
+            color: var(--subtext);
+        }
+        .modal-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(17, 17, 27, 0.78);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+        }
+        .modal-backdrop.open { display: flex; }
+        .modal-box {
+            background: var(--surface);
+            border: 1px solid var(--blue);
+            border-radius: 10px;
+            max-width: 420px;
+            width: 100%;
+            padding: 20px;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+        }
+        .modal-title { font-size: 18px; font-weight: 700; color: #fff; margin: 0 0 8px 0; }
+        .modal-sub { font-size: 13px; color: var(--subtext); margin-bottom: 14px; line-height: 1.4; }
+        .modal-input {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--surface-hover);
+            background: var(--bg);
+            color: var(--text);
+            font-size: 14px;
+            margin-bottom: 10px;
+            outline: none;
+        }
+        .modal-input:focus { border-color: var(--blue); }
+        .modal-error {
+            display: none;
+            color: var(--red);
+            font-size: 13px;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
         #banner {
             display: none;
             padding: 14px 16px;
@@ -1415,6 +1585,22 @@ const htmlTemplate = `<!DOCTYPE html>
 
     <div id="banner"></div>
 
+    <!-- Passphrase Unlock Modal (In-Memory Only) -->
+    <div class="modal-backdrop" id="passphraseModal" role="dialog" aria-modal="true" aria-labelledby="passphraseModalTitle">
+        <div class="modal-box">
+            <h2 class="modal-title" id="passphraseModalTitle">🔒 Unlock SSH Private Key</h2>
+            <div class="modal-sub" id="passphraseModalSub">
+                Enter your SSH key passphrase. It is decrypted in RAM only and never written to disk or <code>.env</code>.
+            </div>
+            <input type="password" class="modal-input" id="sshPassphraseInput" placeholder="SSH key passphrase" autocomplete="current-password">
+            <div class="modal-error" id="passphraseError"></div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-yellow" id="passphraseCancelBtn" onclick="closePassphraseModal()">Cancel</button>
+                <button type="button" class="btn" id="passphraseSubmitBtn" onclick="submitPassphraseModal()">Unlock &amp; Connect</button>
+            </div>
+        </div>
+    </div>
+
     <!-- 4 Selectable Target Mode Cards -->
     <div class="targets-grid">
         <div class="target-card {{ if eq .ActiveMode "nuc" }}active{{ end }}" id="card-nuc">
@@ -1444,11 +1630,24 @@ const htmlTemplate = `<!DOCTYPE html>
                 </div>
                 <div class="target-desc">
                     Establishes an encrypted on-demand SSH tunnel to <code>{{ .GCEHost }}</code>.
+                    <div class="key-status">
+                        Key:
+                        {{ if eq .GCEKeyStatus "locked" }}<span class="warn">🔒 Encrypted (Locked)</span>
+                        {{ else if eq .GCEKeyStatus "unlocked" }}<span class="good">🔓 Unlocked in RAM</span>
+                        {{ else if eq .GCEKeyStatus "unencrypted" }}<span>🗝️ Unencrypted</span>
+                        {{ else if eq .GCEKeyStatus "missing" }}<span class="bad">⚠️ Missing on disk</span>
+                        {{ else }}<span class="bad">⚠️ Invalid key</span>{{ end }}
+                    </div>
                 </div>
             </div>
-            <button class="btn {{ if eq .ActiveMode "gce" }}btn-blue{{ end }}" onclick="switchMode('gce')" {{ if eq .ActiveMode "gce" }}disabled{{ end }}>
-                {{ if eq .ActiveMode "gce" }}Currently Active{{ else }}Connect GCE SSH Tunnel{{ end }}
-            </button>
+            <div class="card-actions">
+                <button class="btn btn-primary-action {{ if eq .ActiveMode "gce" }}btn-blue{{ end }}" onclick="switchMode('gce')" {{ if eq .ActiveMode "gce" }}disabled{{ end }}>
+                    {{ if eq .ActiveMode "gce" }}Currently Active{{ else if eq .GCEKeyStatus "locked" }}Unlock &amp; Connect GCE{{ else }}Connect GCE SSH Tunnel{{ end }}
+                </button>
+                {{ if eq .GCEKeyStatus "unlocked" }}
+                <button class="btn btn-red btn-sm" title="Wipe decrypted key from RAM" onclick="lockSSHKey('gce')">🔒 Lock</button>
+                {{ end }}
+            </div>
         </div>
 
         <div class="target-card {{ if eq .ActiveMode "oci" }}active{{ end }}" id="card-oci">
@@ -1461,11 +1660,24 @@ const htmlTemplate = `<!DOCTYPE html>
                 </div>
                 <div class="target-desc">
                     Establishes an encrypted on-demand SSH tunnel to <code>{{ .OCIHost }}</code>.
+                    <div class="key-status">
+                        Key:
+                        {{ if eq .OCIKeyStatus "locked" }}<span class="warn">🔒 Encrypted (Locked)</span>
+                        {{ else if eq .OCIKeyStatus "unlocked" }}<span class="good">🔓 Unlocked in RAM</span>
+                        {{ else if eq .OCIKeyStatus "unencrypted" }}<span>🗝️ Unencrypted</span>
+                        {{ else if eq .OCIKeyStatus "missing" }}<span class="bad">⚠️ Missing on disk</span>
+                        {{ else }}<span class="bad">⚠️ Invalid key</span>{{ end }}
+                    </div>
                 </div>
             </div>
-            <button class="btn {{ if eq .ActiveMode "oci" }}btn-blue{{ end }}" onclick="switchMode('oci')" {{ if eq .ActiveMode "oci" }}disabled{{ end }}>
-                {{ if eq .ActiveMode "oci" }}Currently Active{{ else }}Connect Oracle SSH Tunnel{{ end }}
-            </button>
+            <div class="card-actions">
+                <button class="btn btn-primary-action {{ if eq .ActiveMode "oci" }}btn-blue{{ end }}" onclick="switchMode('oci')" {{ if eq .ActiveMode "oci" }}disabled{{ end }}>
+                    {{ if eq .ActiveMode "oci" }}Currently Active{{ else if eq .OCIKeyStatus "locked" }}Unlock &amp; Connect Oracle{{ else }}Connect Oracle SSH Tunnel{{ end }}
+                </button>
+                {{ if eq .OCIKeyStatus "unlocked" }}
+                <button class="btn btn-red btn-sm" title="Wipe decrypted key from RAM" onclick="lockSSHKey('oci')">🔒 Lock</button>
+                {{ end }}
+            </div>
         </div>
 
         <div class="target-card {{ if eq .ActiveMode "vpngate" }}active{{ end }}" id="card-vpngate">
@@ -1662,7 +1874,62 @@ const htmlTemplate = `<!DOCTYPE html>
             rows.forEach(r => tbody.appendChild(r));
         }
 
-        async function switchMode(mode) {
+        let pendingUnlockMode = '';
+
+        function openPassphraseModal(mode, errorText) {
+            pendingUnlockMode = mode;
+            const modal = document.getElementById('passphraseModal');
+            const title = document.getElementById('passphraseModalTitle');
+            const sub = document.getElementById('passphraseModalSub');
+            const input = document.getElementById('sshPassphraseInput');
+            const errEl = document.getElementById('passphraseError');
+
+            const label = mode === 'oci' ? 'Oracle Cloud VM ({{ .OCIHost }})' : 'Google Cloud VM ({{ .GCEHost }})';
+            title.textContent = '🔒 Unlock SSH Key — ' + (mode === 'oci' ? 'Oracle Cloud' : 'Google Cloud');
+            sub.innerHTML = 'Enter the passphrase for <strong>' + label + '</strong>. Decrypted in RAM only — never saved to disk or <code>.env</code>.';
+            input.value = '';
+            if (errorText) {
+                errEl.textContent = errorText;
+                errEl.style.display = 'block';
+            } else {
+                errEl.textContent = '';
+                errEl.style.display = 'none';
+            }
+            modal.classList.add('open');
+            setTimeout(() => input.focus(), 50);
+        }
+
+        function closePassphraseModal() {
+            pendingUnlockMode = '';
+            document.getElementById('passphraseModal').classList.remove('open');
+            document.getElementById('sshPassphraseInput').value = '';
+        }
+
+        function submitPassphraseModal() {
+            if (!pendingUnlockMode) return;
+            const pass = document.getElementById('sshPassphraseInput').value;
+            const errEl = document.getElementById('passphraseError');
+            if (!pass) {
+                errEl.textContent = 'Please enter your SSH key passphrase.';
+                errEl.style.display = 'block';
+                document.getElementById('sshPassphraseInput').focus();
+                return;
+            }
+            const mode = pendingUnlockMode;
+            document.getElementById('passphraseModal').classList.remove('open');
+            switchMode(mode, pass);
+        }
+
+        document.getElementById('sshPassphraseInput').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                submitPassphraseModal();
+            } else if (e.key === 'Escape') {
+                closePassphraseModal();
+            }
+        });
+
+        async function switchMode(mode, passphrase) {
             setAllButtonsDisabled(true);
             let bannerMsg = 'Switching to Direct (Local ISP) and stopping background tunnels...';
             if (mode === 'gce') {
@@ -1672,19 +1939,53 @@ const htmlTemplate = `<!DOCTYPE html>
             }
             showBanner(bannerMsg, '');
             try {
+                const payload = { mode };
+                if (passphrase) {
+                    payload.passphrase = passphrase;
+                }
                 const res = await fetch('/api/mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (!res.ok || !data.ok) {
+                    if (res.status === 401 && data.needsPassphrase) {
+                        document.getElementById('banner').style.display = 'none';
+                        setAllButtonsDisabled(false);
+                        openPassphraseModal(mode, data.wrongPassphrase ? (data.error || 'Incorrect passphrase.') : '');
+                        return;
+                    }
+                    showBanner('Error: ' + (data.error || 'Failed to switch mode'), 'error');
+                    setAllButtonsDisabled(false);
+                    return;
+                }
+                pendingUnlockMode = '';
+                showBanner(data.message || 'Switched successfully! Reloading status...', 'success');
+                setTimeout(() => window.location.href = '/', 600);
+            } catch (e) {
+                showBanner('Network error: ' + e.message, 'error');
+                setAllButtonsDisabled(false);
+            }
+        }
+
+        async function lockSSHKey(mode) {
+            setAllButtonsDisabled(true);
+            showBanner('Wiping unlocked SSH key from RAM...', '');
+            try {
+                const res = await fetch('/api/ssh-lock', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ mode })
                 });
                 const data = await res.json();
                 if (!res.ok || !data.ok) {
-                    showBanner('Error: ' + (data.error || 'Failed to switch mode'), 'error');
+                    showBanner('Error: ' + (data.error || 'Failed to lock SSH key'), 'error');
                     setAllButtonsDisabled(false);
                     return;
                 }
-                showBanner(data.message || 'Switched successfully! Reloading status...', 'success');
-                setTimeout(() => window.location.href = '/', 600);
+                showBanner(data.message || 'SSH key locked and cleared from RAM.', 'success');
+                setTimeout(() => window.location.href = '/', 500);
             } catch (e) {
                 showBanner('Network error: ' + e.message, 'error');
                 setAllButtonsDisabled(false);
@@ -1871,6 +2172,8 @@ func setupWebRoutes(c *Controller) http.Handler {
 			"ProxyPort":      proxyPort,
 			"GCEHost":        normalizeSSHHost(gceHost),
 			"OCIHost":        normalizeSSHHost(ociHost),
+			"GCEKeyStatus":   c.getKeyStatus(ModeGCE),
+			"OCIKeyStatus":   c.getKeyStatus(ModeOCI),
 			"ActiveMode":     activeMode,
 			"VPNGateIP":      vpngateIP,
 			"VPNGateCountry": vpngateCountry,
@@ -1929,9 +2232,35 @@ func setupWebRoutes(c *Controller) http.Handler {
 			"isTransitioning": transitioning,
 			"vpngateIP":       vpngateIP,
 			"vpngateCountry":  vpngateCountry,
+			"gceKeyStatus":    c.getKeyStatus(ModeGCE),
+			"ociKeyStatus":    c.getKeyStatus(ModeOCI),
 			"exitInfo":        exitInfo,
 			"homeInfo":        homeInfo,
 			"idleRemaining":   formatDurationShort(c.remainingIdleDuration()),
+		})
+	})
+
+	// Lock / Wipe Unlocked SSH Keys from RAM
+	mux.HandleFunc("/api/ssh-lock", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Mode string `json:"mode"`
+		}
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&req)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := c.lockSSHKey(req.Mode); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":      true,
+			"message": "SSH key locked and cleared from memory.",
 		})
 	})
 
@@ -1942,13 +2271,31 @@ func setupWebRoutes(c *Controller) http.Handler {
 			return
 		}
 		var req struct {
-			Mode string `json:"mode"`
+			Mode       string `json:"mode"`
+			Passphrase string `json:"passphrase"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+
+		writeSSHModeErr := func(err error, mode string) {
+			if errors.Is(err, errSSHPassphraseRequired) || errors.Is(err, errSSHWrongPassphrase) {
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"ok":              false,
+					"needsPassphrase": true,
+					"wrongPassphrase": errors.Is(err, errSSHWrongPassphrase),
+					"mode":            mode,
+					"error":           err.Error(),
+				})
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+		}
+
 		switch req.Mode {
 		case ModeNUC:
 			if err := c.SwitchToNUC(); err != nil {
@@ -1961,9 +2308,8 @@ func setupWebRoutes(c *Controller) http.Handler {
 				"message": "Switched to Direct (Local ISP). Background VPN/SSH tunnels stopped.",
 			})
 		case ModeGCE:
-			if err := c.SwitchToGCE(); err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+			if err := c.SwitchToGCEWithPassphrase(req.Passphrase); err != nil {
+				writeSSHModeErr(err, ModeGCE)
 				return
 			}
 			exitInfo, _, _ := c.refreshIPStatus(false)
@@ -1976,9 +2322,8 @@ func setupWebRoutes(c *Controller) http.Handler {
 				"message": fmt.Sprintf("Connected to Google Cloud VM! Proxy now exits at %s.", exitStr),
 			})
 		case ModeOCI:
-			if err := c.SwitchToOCI(); err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+			if err := c.SwitchToOCIWithPassphrase(req.Passphrase); err != nil {
+				writeSSHModeErr(err, ModeOCI)
 				return
 			}
 			exitInfo, _, _ := c.refreshIPStatus(false)

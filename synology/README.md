@@ -60,11 +60,14 @@ Gluetun requires the Linux TUN kernel driver (`/dev/net/tun`).
      ```
 3. Click **OK**, right-click the task, and select **Run**.
 
-### Step 2: Upload Files & Grant Permissions
-1. Upload `docker-compose.yml`, `.env`, and your SSH private key into `/volume1/docker/my-vpn-2/`.
-2. Right-click `/volume1/docker/my-vpn-2` in **File Station** $\rightarrow$ **Properties** $\rightarrow$ **Permission** tab:
-   - Click **Create** $\rightarrow$ User: **`Everyone`** $\rightarrow$ Type: **Allow** $\rightarrow$ Permission: **Read & Write** (Full Control).
-   - Check **Apply to this folder, sub-folders and files** $\rightarrow$ Click **Save**.
+### Step 2: Upload Files & Secure Permissions
+1. **Encrypt your SSH private key** (recommended) before uploading so no unencrypted key sits on disk:
+   ```bash
+   ssh-keygen -p -f id_rsa
+   ```
+   When you click **Unlock & Connect** in the Web UI, your passphrase is decrypted in RAM only and never written to disk.
+2. Upload `docker-compose.yml`, `.env`, and your SSH private key into `/volume1/docker/my-vpn-2/`.
+3. Because `my-vpn-2-controller` runs as `root` (`user: "0:0"`), keep `/volume1/docker/my-vpn-2` restricted to your admin account (avoid granting `Everyone` access) and optionally store `/volume1/docker/my-vpn-2` inside a Synology **Encrypted Shared Folder**.
 
 ### Step 3: Create and Start the Project
 1. Open **Container Manager** $\rightarrow$ **Project** $\rightarrow$ **Create**:

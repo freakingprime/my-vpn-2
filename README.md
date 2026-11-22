@@ -33,3 +33,12 @@ An ultra-lightweight Go HTTP/HTTPS Proxy Gateway and Web Controller that lets yo
    ```
 
 For **Synology DSM 7.2+ Container Manager** deployment instructions, see [`synology/README.md`](synology/README.md).
+
+## SSH Key Security & VM Hardening
+
+1. **Passphrase-Encrypted Keys (In-Memory Web UI Unlock)**:
+   - Encrypt your SSH private key before uploading (`ssh-keygen -p -f id_rsa`, or generate a new one with a passphrase).
+   - No passphrase is ever stored in `.env` or on disk. When connecting to GCE or Oracle Cloud, the Web UI prompts for your passphrase, keeps the unlocked signer in RAM only, lets you wipe it anytime with **🔒 Lock**, and auto-wipes it after 4 hours of inactivity.
+2. **Locked-Down, Port-Forwarding-Only VM User**:
+   - Avoid uploading your admin/sudo key to your proxy host. Run [`scripts/setup-vm-user.sh`](scripts/setup-vm-user.sh) on your GCE or Oracle Cloud VM (`sudo bash scripts/setup-vm-user.sh nasproxy "<public_key>"`) to create a `nologin`, non-sudo user whose `authorized_keys` is locked to `restrict,port-forwarding`.
+

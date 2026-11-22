@@ -715,3 +715,106 @@ func TestMockOCISSHServer(t *testing.T) {
 	}
 }
 
+// TestEncryptedSSHKeyWebUnlockAndLock tests passphrase-encrypted SSH keys, Web UI unlock API, RAM caching, and /api/ssh-lock
+func TestEncryptedSSHKeyWebUnlockAndLock(t *testing.T) {
+	ociAddr, _, closeOCI := startMockSSHForwardServer(t, "nasproxy")
+	defer closeOCI()
+
+	// Create an OpenSSH passphrase-encrypted private key
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed generating RSA key: %v", err)
+	}
+	const passphrase = "super-secret-passphrase"
+	encBlock, err := ssh.MarshalPrivateKeyWithPassphrase(privKey, "encrypted-test", []byte(passphrase))
+	if err != nil {
+		t.Fatalf("failed encrypting RSA key: %v", err)
+	}
+	encKeyPath := filepath.Join(t.TempDir(), "enc_id_rsa")
+	if err := os.WriteFile(encKeyPath, pem.EncodeToMemory(encBlock), 0600); err != nil {
+		t.Fatalf("failed writing encrypted test key: %v", err)
+	}
+
+	origOCIHost, origOCIKey, origOCIUser := ociHost, ociKeyPath, ociUser
+	defer func() {
+		ociHost, ociKeyPath, ociUser = origOCIHost, origOCIKey, origOCIUser
+	}()
+	ociHost, ociKeyPath, ociUser = ociAddr, encKeyPath, "nasproxy"
+
+	ctrl := NewController()
+	handler := setupWebRoutes(ctrl)
+
+	if status := ctrl.getKeyStatus(ModeOCI); status != "locked" {
+		t.Fatalf("expected initial key status 'locked', got %q", status)
+	}
+
+	// 1. Connecting without passphrase returns 401 needsPassphrase=true
+	req1 := httptest.NewRequest("POST", "/api/mode", bytes.NewBufferString(`{"mode":"oci"}`))
+	req1.Header.Set("Content-Type", "application/json")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, req1)
+	if w1.Result().StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when passphrase missing, got %d", w1.Result().StatusCode)
+	}
+	var resp1 map[string]interface{}
+	_ = json.NewDecoder(w1.Body).Decode(&resp1)
+	if resp1["needsPassphrase"] != true || resp1["wrongPassphrase"] != false {
+		t.Fatalf("expected needsPassphrase=true wrongPassphrase=false, got %+v", resp1)
+	}
+
+	// 2. Connecting with wrong passphrase returns 401 wrongPassphrase=true
+	req2 := httptest.NewRequest("POST", "/api/mode", bytes.NewBufferString(`{"mode":"oci","passphrase":"wrong"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+	if w2.Result().StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when passphrase wrong, got %d", w2.Result().StatusCode)
+	}
+	var resp2 map[string]interface{}
+	_ = json.NewDecoder(w2.Body).Decode(&resp2)
+	if resp2["needsPassphrase"] != true || resp2["wrongPassphrase"] != true {
+		t.Fatalf("expected needsPassphrase=true wrongPassphrase=true, got %+v", resp2)
+	}
+
+	// 3. Connecting with correct passphrase succeeds and caches signer in RAM
+	req3 := httptest.NewRequest("POST", "/api/mode", bytes.NewBufferString(fmt.Sprintf(`{"mode":"oci","passphrase":%q}`, passphrase)))
+	req3.Header.Set("Content-Type", "application/json")
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, req3)
+	if w3.Result().StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(w3.Body)
+		t.Fatalf("expected 200 unlocking with valid passphrase, got %d: %s", w3.Result().StatusCode, string(body))
+	}
+	if status := ctrl.getKeyStatus(ModeOCI); status != "unlocked" {
+		t.Fatalf("expected key status 'unlocked', got %q", status)
+	}
+
+	// 4. Switching to NUC and back to OCI without passphrase reuses RAM signer
+	if err := ctrl.SwitchToNUC(); err != nil {
+		t.Fatalf("SwitchToNUC failed: %v", err)
+	}
+	req4 := httptest.NewRequest("POST", "/api/mode", bytes.NewBufferString(`{"mode":"oci"}`))
+	req4.Header.Set("Content-Type", "application/json")
+	w4 := httptest.NewRecorder()
+	handler.ServeHTTP(w4, req4)
+	if w4.Result().StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 reusing unlocked RAM key, got %d", w4.Result().StatusCode)
+	}
+
+	// 5. Locking key via /api/ssh-lock wipes RAM signer and disconnects active OCI tunnel
+	req5 := httptest.NewRequest("POST", "/api/ssh-lock", bytes.NewBufferString(`{"mode":"oci"}`))
+	req5.Header.Set("Content-Type", "application/json")
+	w5 := httptest.NewRecorder()
+	handler.ServeHTTP(w5, req5)
+	if w5.Result().StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /api/ssh-lock, got %d", w5.Result().StatusCode)
+	}
+	if status := ctrl.getKeyStatus(ModeOCI); status != "locked" {
+		t.Fatalf("expected key status 'locked' after /api/ssh-lock, got %q", status)
+	}
+	if ctrl.activeMode != ModeNUC || ctrl.sshClient != nil {
+		t.Fatalf("expected activeMode=nuc and nil sshClient after locking active mode, got mode=%s client=%v", ctrl.activeMode, ctrl.sshClient)
+	}
+}
+
+
